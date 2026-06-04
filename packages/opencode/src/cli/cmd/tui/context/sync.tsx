@@ -33,6 +33,7 @@ import { emptyConsoleState, type ConsoleState } from "@opencode-ai/core/v1/confi
 import path from "path"
 import { useKV } from "./kv"
 import { aggregateFailures } from "./aggregate-failures"
+import { mergeFetchedMessages, optimisticParts, type OptimisticPromptPart } from "./sync-optimistic"
 
 export const { use: useSync, provider: SyncProvider } = createSimpleContext({
   name: "Sync",
@@ -116,6 +117,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
+    const optimisticMessages = new Set<string>()
     const touchMessage = (sessionID: string, messageID: string) => {
       hydratingSessions.get(sessionID)?.messages.add(messageID)
     }
@@ -235,6 +237,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           break
 
         case "session.deleted": {
+          for (const message of store.message[event.properties.info.id] ?? []) optimisticMessages.delete(message.id)
           const result = Binary.search(store.session, event.properties.info.id, (s) => s.id)
           if (result.found) {
             setStore(
@@ -308,6 +311,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         }
         case "message.removed": {
           touchMessage(event.properties.sessionID, event.properties.messageID)
+          optimisticMessages.delete(event.properties.messageID)
           const messages = store.message[event.properties.sessionID]
           const result = Binary.search(messages, event.properties.messageID, (m) => m.id)
           if (result.found) {
@@ -323,6 +327,7 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
         }
         case "message.part.updated": {
           touchPart(event.properties.part.sessionID, event.properties.part.id)
+          optimisticMessages.delete(event.properties.part.messageID)
           const parts = store.part[event.properties.part.messageID]
           if (!parts) {
             setStore("part", event.properties.part.messageID, [event.properties.part])
@@ -539,6 +544,66 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
           if (last.role === "user") return "working"
           return last.time.completed ? "idle" : "working"
         },
+        addOptimisticPrompt(input: {
+          sessionID: string
+          messageID: string
+          agent: string
+          model: { providerID: string; modelID: string }
+          variant?: string
+          parts: OptimisticPromptPart[]
+        }) {
+          optimisticMessages.add(input.messageID)
+          const messages = store.message[input.sessionID]
+          const match = messages ? Binary.search(messages, input.messageID, (m) => m.id) : undefined
+          const info: Message = {
+            id: input.messageID,
+            sessionID: input.sessionID,
+            role: "user",
+            time: { created: Date.now() },
+            agent: input.agent,
+            model: {
+              providerID: input.model.providerID,
+              modelID: input.model.modelID,
+              ...(input.variant ? { variant: input.variant } : {}),
+            },
+          }
+          batch(() => {
+            if (!messages) {
+              setStore("message", input.sessionID, [info])
+            } else if (!match?.found) {
+              setStore(
+                "message",
+                input.sessionID,
+                produce((draft) => {
+                  Binary.insert(draft, info, (message) => message.id)
+                }),
+              )
+            }
+            setStore("part", input.messageID, reconcile(optimisticParts(input)))
+          })
+        },
+        removeOptimisticPrompt(sessionID: string, messageID: string) {
+          if (!optimisticMessages.delete(messageID)) return
+          const messages = store.message[sessionID]
+          const match = messages ? Binary.search(messages, messageID, (m) => m.id) : undefined
+          batch(() => {
+            if (match?.found) {
+              setStore(
+                "message",
+                sessionID,
+                produce((draft) => {
+                  draft.splice(match.index, 1)
+                }),
+              )
+            }
+            setStore(
+              "part",
+              produce((draft) => {
+                delete draft[messageID]
+              }),
+            )
+          })
+        },
         async sync(sessionID: string) {
           if (fullSyncedSessions.has(sessionID)) return
           const syncing = syncingSessions.get(sessionID)
@@ -555,13 +620,19 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
             setStore(
               produce((draft) => {
                 const match = Binary.search(draft.session, sessionID, (s) => s.id)
+                const merged = mergeFetchedMessages({
+                  currentMessages: draft.message[sessionID] ?? [],
+                  currentParts: draft.part,
+                  fetched: messages.data ?? [],
+                  optimisticMessages,
+                })
                 if (match.found) draft.session[match.index] = session.data!
                 if (!match.found) draft.session.splice(match.index, 0, session.data!)
                 draft.todo[sessionID] = todo.data ?? []
                 const currentMessages = draft.message[sessionID] ?? []
-                const infos = (messages.data ?? []).flatMap((message) => {
-                  if (!tracker.messages.has(message.info.id)) return [message.info]
-                  const current = currentMessages.find((item) => item.id === message.info.id)
+                const infos = merged.messages.flatMap((message) => {
+                  if (!tracker.messages.has(message.id)) return [message]
+                  const current = currentMessages.find((item) => item.id === message.id)
                   return current ? [current] : []
                 })
                 infos.push(
@@ -578,7 +649,8 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                     continue
                   }
                   const currentParts = draft.part[message.info.id] ?? []
-                  const parts = message.parts.flatMap((part) => {
+                  const fetchedParts = merged.parts.get(message.info.id)
+                  const parts = (fetchedParts ?? message.parts).flatMap((part) => {
                     const current = currentParts.find((item) => item.id === part.id)
                     if (tracker.parts.has(part.id)) return current ? [current] : []
                     if (
@@ -598,6 +670,9 @@ export const { use: useSync, provider: SyncProvider } = createSimpleContext({
                     ),
                   )
                   draft.part[message.info.id] = parts
+                }
+                for (const messageID of merged.resolved) {
+                  optimisticMessages.delete(messageID)
                 }
                 for (const message of removed) delete draft.part[message.id]
                 draft.message[sessionID] = visible
