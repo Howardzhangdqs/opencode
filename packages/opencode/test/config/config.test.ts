@@ -1,7 +1,7 @@
 import { test, expect, describe, afterEach, beforeEach, spyOn } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Effect, Exit, Layer, Option } from "effect"
-import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http"
+import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { NodeFileSystem, NodePath } from "@effect/platform-node"
 import { Config } from "@/config/config"
 import { ConfigManaged } from "@/config/managed"
@@ -10,10 +10,11 @@ import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 
 import { InstanceRef } from "../../src/effect/instance-ref"
 import type { InstanceContext } from "../../src/project/instance-context"
-import { Auth } from "../../src/auth"
+import { AuthWellKnown } from "@opencode-ai/core/auth-well-known"
 import { Account } from "../../src/account/account"
 import { AccessToken, AccountID, OrgID } from "../../src/account/schema"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Substitution } from "@opencode-ai/core/substitution"
 import { Env } from "../../src/env"
 import {
   provideTmpdirInstance,
@@ -37,7 +38,7 @@ import { Filesystem } from "@/util/filesystem"
 import { ConfigPlugin } from "@/config/plugin"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { AccountTest } from "../fake/account"
-import { AuthTest } from "../fake/auth"
+import { AuthWellKnownTest } from "../fake/auth-well-known"
 import { NpmTest } from "../fake/npm"
 
 /** Infra layer that provides FileSystem, Path, ChildProcessSpawner for test fixtures */
@@ -47,63 +48,83 @@ const infra = CrossSpawnSpawner.defaultLayer.pipe(
 
 const testFlock = EffectFlock.defaultLayer
 
+const emptyAccount = Layer.mock(Account.Service)({
+  active: () => Effect.succeed(Option.none()),
+  activeOrg: () => Effect.succeed(Option.none()),
+})
+
 const unexpectedHttp = HttpClient.make((request) =>
   Effect.die(`unexpected http request: ${request.method} ${request.url}`),
 )
 
-const json = (request: Parameters<typeof HttpClientResponse.fromWeb>[0], body: unknown, status = 200) =>
-  HttpClientResponse.fromWeb(
-    request,
-    new Response(JSON.stringify(body), {
-      status,
-      headers: { "content-type": "application/json" },
-    }),
-  )
-
-const wellKnownAuth = (url: string) =>
-  Layer.mock(Auth.Service)({
-    all: () =>
-      Effect.succeed({
-        [url]: new Auth.WellKnown({ type: "wellknown", key: "TEST_TOKEN", token: "test-token" }),
-      }),
-  })
-
-function remoteConfigClient(input: {
-  wellKnown: unknown
-  remote?: unknown
-  seen: { wellKnown?: string; remote?: string; authorization?: string }
-}) {
-  return HttpClient.make((request) => {
-    if (request.url.includes(".well-known/opencode")) {
-      input.seen.wellKnown = request.url
-      return Effect.succeed(json(request, input.wellKnown))
-    }
-    if (input.remote !== undefined && request.url.includes("config.example.com")) {
-      input.seen.remote = request.url
-      input.seen.authorization = request.headers.authorization
-      return Effect.succeed(json(request, input.remote))
-    }
-    return Effect.succeed(json(request, {}, 404))
-  })
-}
-
 const configLayer = (
   options: {
-    auth?: Layer.Layer<Auth.Service>
+    authWellKnown?: Layer.Layer<AuthWellKnown.Service>
     account?: Layer.Layer<Account.Service>
     client?: HttpClient.HttpClient
   } = {},
 ) =>
   Config.layer.pipe(
     Layer.provide(testFlock),
+    Layer.provide(FSUtil.defaultLayer),
+    Layer.provide(Substitution.defaultLayer),
     Layer.provide(Env.defaultLayer),
-    Layer.provide(options.auth ?? AuthTest.empty),
+    Layer.provide(options.authWellKnown ?? AuthWellKnownTest.empty),
     Layer.provide(options.account ?? AccountTest.empty),
     Layer.provideMerge(infra),
     Layer.provide(NpmTest.noop),
     Layer.provide(Layer.succeed(HttpClient.HttpClient, options.client ?? unexpectedHttp)),
     Layer.provideMerge(FSUtil.defaultLayer),
   )
+
+const wellKnownAuth = (input: {
+  authUrl: string
+  metadata: unknown
+  remote?: unknown
+  seen: { wellKnown?: string; remote?: string; authorization?: string }
+}) =>
+  Layer.mock(AuthWellKnown.Service, {
+    configs: () => {
+      const normalizedUrl = input.authUrl.replace(/\/+$/, "")
+      const source = `${normalizedUrl}/.well-known/opencode`
+      const metadata = isRecordValue(input.metadata) ? input.metadata : {}
+      const out: Array<{ url: string; source: string; dir: string; content: unknown }> = []
+      input.seen.wellKnown = source
+
+      if (isRecordValue(metadata.config)) {
+        out.push({
+          url: normalizedUrl,
+          source,
+          dir: path.dirname(source),
+          content: metadata.config,
+        })
+      }
+
+      const remoteConfig = isRecordValue(metadata.remote_config) ? metadata.remote_config : undefined
+      if (remoteConfig && typeof remoteConfig.url === "string") {
+        const remoteUrl = remoteConfig.url.replaceAll("{env:TEST_TOKEN}", "test-token")
+        input.seen.remote = remoteUrl
+        const headers = isRecordValue(remoteConfig.headers) ? remoteConfig.headers : undefined
+        if (headers && typeof headers.Authorization === "string") {
+          input.seen.authorization = headers.Authorization.replaceAll("{env:TEST_TOKEN}", "test-token")
+        }
+
+        const remote = isRecordValue(input.remote) && isRecordValue(input.remote.config) ? input.remote.config : input.remote
+        out.push({
+          url: remoteUrl,
+          source: remoteUrl,
+          dir: path.dirname(remoteUrl),
+          content: remote,
+        })
+      }
+
+      return Effect.succeed(out)
+    },
+  })
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
 
 const layer = configLayer()
 
@@ -217,17 +238,20 @@ const wellKnown = (input: {
   wellKnown?: unknown
 }) => {
   const seen: { wellKnown?: string; remote?: string; authorization?: string } = {}
-  const client = remoteConfigClient({
-    seen,
-    wellKnown: input.wellKnown ?? {
+  const metadata = input.wellKnown ?? {
       ...(input.config !== undefined ? { config: input.config } : {}),
       ...(input.remoteConfig !== undefined ? { remote_config: input.remoteConfig } : {}),
-    },
-    remote: input.remote,
-  })
+    }
   return {
     seen,
-    it: configIt({ auth: wellKnownAuth(input.authUrl ?? "https://example.com"), client }),
+    it: configIt({
+      authWellKnown: wellKnownAuth({
+        authUrl: input.authUrl ?? "https://example.com",
+        metadata,
+        remote: input.remote,
+        seen,
+      }),
+    }),
   }
 }
 
@@ -1504,8 +1528,18 @@ test("remote well-known config can use FetchHttpClient layer", async () => {
           Config.layer.pipe(
             Layer.provide(testFlock),
             Layer.provide(FSUtil.defaultLayer),
+            Layer.provide(Substitution.defaultLayer),
             Layer.provide(Env.defaultLayer),
-            Layer.provide(wellKnownAuth(server.url.origin)),
+            Layer.provide(
+              wellKnownAuth({
+                authUrl: server.url.origin,
+                metadata: { remote_config: { url: `${server.url.origin}/.well-known/opencode` } },
+                remote: {
+                  mcp: { jira: { type: "remote", url: "https://jira.example.com/mcp", enabled: true } },
+                },
+                seen: {},
+              }),
+            ),
             Layer.provide(AccountTest.empty),
             Layer.provideMerge(infra),
             Layer.provide(NpmTest.noop),
