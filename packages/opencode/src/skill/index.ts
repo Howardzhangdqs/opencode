@@ -32,9 +32,24 @@ const SKILL_PATTERN = "**/SKILL.md"
 const CUSTOMIZE_OPENCODE_SKILL_NAME = "customize-opencode"
 const CUSTOMIZE_OPENCODE_SKILL_DESCRIPTION =
   "Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself."
+const CUSTOMIZE_OPENCODE_SKILL_FALLBACK_BODY = `# Customizing opencode
+
+If you edit opencode's own configuration, use this checklist:
+
+- Use the canonical schema: https://opencode.ai/config.json
+- Add "$schema": "https://opencode.ai/config.json" to opencode.json
+- Keep model IDs provider-prefixed, for example: "anthropic/claude-sonnet-4-6"
+- Use .opencode/agent(s)/<name>.md for project agents
+- Use .opencode/skill(s)/<name>/SKILL.md for project skills
+- Use ~/.config/opencode for global config, agents, and skills
+- Restart opencode after config, agent, skill, plugin, or MCP changes
+
+When a field shape is uncertain, fetch https://opencode.ai/config.json and follow it exactly.`
 const CUSTOMIZE_OPENCODE_SKILL_BODY = await Bun.file(
   new URL("../../../core/src/plugin/skill/customize-opencode.md", import.meta.url),
-).text()
+)
+  .text()
+  .catch(() => CUSTOMIZE_OPENCODE_SKILL_FALLBACK_BODY)
 
 export const Info = Schema.Struct({
   name: Schema.String,
